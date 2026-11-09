@@ -48,13 +48,10 @@ bot = commands.Bot(
 # VOICE CHANNEL TRACKING
 # ==========================================
 
-# Remember previous voice channel per member/server
 previous_channel: dict[tuple[int, int], int] = {}
 
-# Prevent bot-initiated moves from overwriting history
 bot_moves: set[tuple[int, int]] = set()
 
-# Prevent simultaneous enforcement conflicts
 guild_locks = defaultdict(asyncio.Lock)
 
 
@@ -123,7 +120,6 @@ async def enforce_limit(
             f"no available previous VC for {full_channel.name}"
         )
 
-    # Mark the bot-initiated move
     bot_moves.add(key_for(member))
 
     try:
@@ -153,23 +149,20 @@ async def enforce_limit(
 
 
 # ==========================================
-# ROTATING BOT STATUS
+# ROTATING BOT ACTIVITIES
 # ==========================================
 
 ACTIVITIES = [
 
-    # Status 1
     discord.Game(
         name="Enforcing VC limits"
     ),
 
-    # Status 2
     discord.Activity(
         type=discord.ActivityType.watching,
         name="over voice channels"
     ),
 
-    # Status 3
     discord.Game(
         name="Designed by 1shot"
     )
@@ -232,7 +225,15 @@ async def on_ready():
                     None
                 )
 
-    # Start status rotation
+    # Publish first status immediately
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=ACTIVITIES[0]
+    )
+
+    log.info("Initial bot status published")
+
+    # Start automatic status rotation
     if not rotate_status.is_running():
 
         rotate_status.start()
@@ -282,7 +283,7 @@ async def on_voice_state_update(
     if not isinstance(destination, discord.VoiceChannel):
         return
 
-    # Unlimited channels are ignored
+    # Ignore unlimited channels
     if destination.user_limit == 0:
         return
 
