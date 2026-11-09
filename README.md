@@ -2,13 +2,6 @@
 
 A Discord voice-channel capacity enforcement bot. It reads each standard voice channel's configured user limit. If a member enters a full limited channel, the bot tries to return that member to the voice channel they just left. If there is no usable previous channel, it disconnects them.
 
-## Deploy on Railway
-
-1. Create a GitHub repository and upload `bot.py`, `requirements.txt`, and `Dockerfile` to its root. Do **not** upload a token or `.env` file.
-2. In Railway, create a project using **Deploy from GitHub Repo** and select that repository.
-3. In the Railway service's **Variables** tab, add `DISCORD_TOKEN` with your Discord bot token as its value.
-4. Deploy. The included Dockerfile starts the bot with `python bot.py`.
-5. Check the deployment logs for `Online as ...`.
 
 ## Discord permissions
 
