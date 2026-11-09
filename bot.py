@@ -361,3 +361,4 @@ async def on_error(event, *args, **kwargs):
 log.info("Starting 1shot VC Guard...")
 
 bot.run(TOKEN)
+
