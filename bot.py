@@ -1,5 +1,4 @@
 
-
 import asyncio
 import logging
 import os
@@ -214,20 +213,14 @@ async def enforce_limit(
 # ==========================================
 
 ACTIVITIES = [
-
-    discord.Game(
-        name="Enforcing VC limits"
-    ),
+    discord.Game(name="Enforcing VC limits"),
 
     discord.Activity(
         type=discord.ActivityType.watching,
         name="over voice channels"
     ),
 
-    discord.Game(
-        name="Designed by 1shot"
-    )
-
+    discord.Game(name="Designed by 1shot")
 ]
 
 activity_index = 0
@@ -241,7 +234,6 @@ async def rotate_status():
     activity = ACTIVITIES[activity_index]
 
     try:
-
         await bot.change_presence(
             status=discord.Status.online,
             activity=activity
@@ -257,19 +249,16 @@ async def rotate_status():
         ) % len(ACTIVITIES)
 
     except discord.HTTPException:
-
         log.exception("Could not update bot presence")
 
 
 @rotate_status.before_loop
 async def before_rotate_status():
-
     await bot.wait_until_ready()
 
 
 @rotate_status.error
 async def rotate_status_error(error):
-
     log.exception(
         "Status rotation task failed",
         exc_info=error
@@ -300,7 +289,6 @@ async def vc_announcement():
             continue
 
         try:
-
             await channel.send(ANNOUNCEMENT_MESSAGE)
 
             log.info(
@@ -310,14 +298,12 @@ async def vc_announcement():
             )
 
         except discord.Forbidden:
-
             log.error(
                 "No permission to send messages in voice chat: %s",
                 channel.name
             )
 
         except discord.HTTPException:
-
             log.exception(
                 "Announcement failed in %s",
                 guild.name
@@ -329,13 +315,12 @@ async def before_vc_announcement():
 
     await bot.wait_until_ready()
 
-    # First announcement after 20 minutes
+    # First announcement occurs 20 minutes after startup.
     await asyncio.sleep(20 * 60)
 
 
 @vc_announcement.error
 async def vc_announcement_error(error):
-
     log.exception(
         "Announcement task failed",
         exc_info=error
@@ -443,24 +428,21 @@ async def announcement_test(
     await interaction.response.defer(ephemeral=True)
 
     try:
-
         await channel.send(ANNOUNCEMENT_MESSAGE)
 
         await interaction.followup.send(
-            f"Test announcement sent to voice chat "
+            f"Test announcement sent to the voice chat "
             f"of **{channel.name}**.",
             ephemeral=True
         )
 
     except discord.Forbidden:
-
         await interaction.followup.send(
             "I don't have permission to send messages in that voice chat.",
             ephemeral=True
         )
 
     except discord.HTTPException:
-
         log.exception("Test announcement failed")
 
         await interaction.followup.send(
@@ -596,18 +578,22 @@ async def on_ready():
         if not vc_announcement.is_running():
             vc_announcement.start()
 
-        # Synchronise slash commands
-        synced = await bot.tree.sync()
+        # Register commands specifically in each server
+        for guild in bot.guilds:
 
-        log.info(
-            "Slash commands synced: %s commands",
-            len(synced)
-        )
+            bot.tree.copy_global_to(guild=guild)
+
+            synced = await bot.tree.sync(guild=guild)
+
+            log.info(
+                "Slash commands synced for %s: %s commands",
+                guild.name,
+                len(synced)
+            )
 
         log.info("1shot VC Guard fully operational.")
 
     except Exception:
-
         log.exception("ERROR INSIDE on_ready")
 
 
@@ -629,23 +615,18 @@ async def on_voice_state_update(
 
     # Ignore bot-initiated moves
     if key in bot_moves:
-
         bot_moves.discard(key)
         return
 
     # Clear history when disconnected
     if after.channel is None:
-
         previous_channel.pop(key, None)
         return
 
     # Remember previous channel
     if before.channel is not None:
-
         previous_channel[key] = before.channel.id
-
     else:
-
         previous_channel.pop(key, None)
 
     destination = after.channel
@@ -662,7 +643,6 @@ async def on_voice_state_update(
 
     async with guild_locks[member.guild.id]:
 
-        # Check whether member is still connected
         if member.voice is None or member.voice.channel is None:
             return
 
@@ -674,11 +654,9 @@ async def on_voice_state_update(
         if current.user_limit == 0:
             return
 
-        # Check channel capacity
         if len(current.members) <= current.user_limit:
             return
 
-        # Move excess member
         await enforce_limit(member, current)
 
 
@@ -688,7 +666,6 @@ async def on_voice_state_update(
 
 @bot.event
 async def on_error(event, *args, **kwargs):
-
     log.exception(
         "Unhandled error in event: %s",
         event
@@ -702,4 +679,5 @@ async def on_error(event, *args, **kwargs):
 log.info("Starting 1shot VC Guard...")
 
 bot.run(TOKEN)
+
 
