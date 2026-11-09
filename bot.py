@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 from collections import defaultdict
+from typing import Optional
 
 import discord
 from discord.ext import commands, tasks
@@ -48,7 +49,7 @@ bot = commands.Bot(
 # VOICE CHANNEL TRACKING
 # ==========================================
 
-previous_channel: dict[tuple[int, int], int] = {}
+previous_channel: dict[tuple[int, int], Optional[int]] = {}
 
 bot_moves: set[tuple[int, int]] = set()
 
@@ -120,7 +121,9 @@ async def enforce_limit(
             f"no available previous VC for {full_channel.name}"
         )
 
-    bot_moves.add(key_for(member))
+    key = key_for(member)
+
+    bot_moves.add(key)
 
     try:
         await member.move_to(
@@ -133,18 +136,17 @@ async def enforce_limit(
             member,
             member.id,
             full_channel.name,
-            destination.name if destination else "Disconnected",
+            destination.name if destination else "Disconnected"
         )
 
-    except (discord.Forbidden, discord.HTTPException) as exc:
+    except (discord.Forbidden, discord.HTTPException):
 
-        bot_moves.discard(key_for(member))
+        bot_moves.discard(key)
 
         log.exception(
-            "Could not move %s from %s: %s",
+            "Could not move %s from %s",
             member,
-            full_channel.name,
-            exc
+            full_channel.name
         )
 
 
@@ -179,25 +181,40 @@ async def rotate_status():
 
     activity = ACTIVITIES[activity_index]
 
-    await bot.change_presence(
-        status=discord.Status.online,
-        activity=activity
-    )
+    try:
 
-    log.info(
-        "Bot status changed to: %s",
-        activity.name
-    )
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=activity
+        )
 
-    activity_index = (
-        activity_index + 1
-    ) % len(ACTIVITIES)
+        log.info(
+            "Bot status changed to: %s",
+            activity.name
+        )
+
+        activity_index = (
+            activity_index + 1
+        ) % len(ACTIVITIES)
+
+    except discord.HTTPException:
+
+        log.exception("Could not update bot presence")
 
 
 @rotate_status.before_loop
 async def before_rotate_status():
 
     await bot.wait_until_ready()
+
+
+@rotate_status.error
+async def rotate_status_error(error):
+
+    log.exception(
+        "Status rotation task failed",
+        exc_info=error
+    )
 
 
 # ==========================================
@@ -207,38 +224,50 @@ async def before_rotate_status():
 @bot.event
 async def on_ready():
 
+    log.info("STEP 1: on_ready event started")
+
     log.info(
         "Online as %s (%s)",
         bot.user,
         bot.user.id
     )
 
-    # Initialize existing voice channel members
-    for guild in bot.guilds:
+    try:
 
-        for channel in guild.voice_channels:
+        # Initialize voice channel tracking
+        log.info("STEP 2: Initializing voice channels")
 
-            for member in channel.members:
+        for guild in bot.guilds:
 
-                previous_channel.setdefault(
-                    key_for(member),
-                    None
-                )
+            for channel in guild.voice_channels:
 
-    # Publish first status immediately
-    await bot.change_presence(
-        status=discord.Status.online,
-        activity=ACTIVITIES[0]
-    )
+                for member in channel.members:
 
-    log.info("Initial bot status published")
+                    previous_channel.setdefault(
+                        key_for(member),
+                        None
+                    )
 
-    # Start automatic status rotation
-    if not rotate_status.is_running():
+        log.info("STEP 3: Voice channels initialized")
 
-        rotate_status.start()
+        # Publish initial status
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=ACTIVITIES[0]
+        )
 
-        log.info("Rotating status system started")
+        log.info("STEP 4: Initial status published")
+
+        # Start automatic status rotation
+        if not rotate_status.is_running():
+
+            rotate_status.start()
+
+        log.info("STEP 5: Status rotation started")
+
+    except Exception:
+
+        log.exception("ERROR INSIDE on_ready")
 
 
 # ==========================================
@@ -263,7 +292,7 @@ async def on_voice_state_update(
         bot_moves.discard(key)
         return
 
-    # Clear history if member disconnects
+    # Clear history when disconnected
     if after.channel is None:
 
         previous_channel.pop(key, None)
@@ -287,12 +316,12 @@ async def on_voice_state_update(
     if destination.user_limit == 0:
         return
 
-    # Allow Discord member state to settle
+    # Allow Discord state to settle
     await asyncio.sleep(0.35)
 
     async with guild_locks[member.guild.id]:
 
-        # Verify member is still connected
+        # Check whether member is still connected
         if member.voice is None or member.voice.channel is None:
             return
 
@@ -313,7 +342,22 @@ async def on_voice_state_update(
 
 
 # ==========================================
+# BOT ERROR HANDLING
+# ==========================================
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+
+    log.exception(
+        "Unhandled error in event: %s",
+        event
+    )
+
+
+# ==========================================
 # START BOT
 # ==========================================
+
+log.info("Starting 1shot VC Guard...")
 
 bot.run(TOKEN)
