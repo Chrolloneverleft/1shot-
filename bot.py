@@ -1,12 +1,16 @@
 
+
 import asyncio
 import logging
 import os
+import sqlite3
+from pathlib import Path
 from collections import defaultdict
 from typing import Optional
 
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands
 
 
 # ==========================================
@@ -17,6 +21,15 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN environment variable")
+
+ANNOUNCEMENT_MESSAGE = (
+    "Enforcing VC limits actively ~ designed by 1shot"
+)
+
+DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DB_PATH = DATA_DIR / "1shot_vc_guard.db"
 
 
 # ==========================================
@@ -29,6 +42,52 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("1shot-vc-guard")
+
+
+# ==========================================
+# DATABASE
+# ==========================================
+
+def init_database():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS announcements (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL
+            )
+        """)
+
+
+def set_announcement_channel(guild_id, channel_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO announcements (guild_id, channel_id)
+            VALUES (?, ?)
+            ON CONFLICT(guild_id)
+            DO UPDATE SET channel_id = excluded.channel_id
+        """, (guild_id, channel_id))
+
+
+def get_announcement_channel(guild_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        result = conn.execute(
+            "SELECT channel_id FROM announcements WHERE guild_id = ?",
+            (guild_id,)
+        ).fetchone()
+
+    return result[0] if result else None
+
+
+def remove_announcement_channel(guild_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "DELETE FROM announcements WHERE guild_id = ?",
+            (guild_id,)
+        )
+        return cursor.rowcount > 0
+
+
+init_database()
 
 
 # ==========================================
@@ -218,13 +277,288 @@ async def rotate_status_error(error):
 
 
 # ==========================================
+# AUTOMATED VOICE CHAT ANNOUNCEMENTS
+# ==========================================
+
+@tasks.loop(minutes=20)
+async def vc_announcement():
+
+    for guild in bot.guilds:
+
+        channel_id = get_announcement_channel(guild.id)
+
+        if channel_id is None:
+            continue
+
+        channel = guild.get_channel(channel_id)
+
+        if not isinstance(channel, discord.VoiceChannel):
+            log.warning(
+                "Configured voice channel missing in %s",
+                guild.name
+            )
+            continue
+
+        try:
+
+            await channel.send(ANNOUNCEMENT_MESSAGE)
+
+            log.info(
+                "Announcement sent to voice chat: %s in %s",
+                channel.name,
+                guild.name
+            )
+
+        except discord.Forbidden:
+
+            log.error(
+                "No permission to send messages in voice chat: %s",
+                channel.name
+            )
+
+        except discord.HTTPException:
+
+            log.exception(
+                "Announcement failed in %s",
+                guild.name
+            )
+
+
+@vc_announcement.before_loop
+async def before_vc_announcement():
+
+    await bot.wait_until_ready()
+
+    # First announcement after 20 minutes
+    await asyncio.sleep(20 * 60)
+
+
+@vc_announcement.error
+async def vc_announcement_error(error):
+
+    log.exception(
+        "Announcement task failed",
+        exc_info=error
+    )
+
+
+# ==========================================
+# ANNOUNCEMENT PERMISSION CHECK
+# ==========================================
+
+def is_server_admin(interaction: discord.Interaction) -> bool:
+
+    return (
+        interaction.guild is not None
+        and interaction.user.guild_permissions.administrator
+    )
+
+
+# ==========================================
+# SET ANNOUNCEMENT VOICE CHANNEL
+# ==========================================
+
+@bot.tree.command(
+    name="announcement_set",
+    description="Set the voice channel for automatic announcements."
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def announcement_set(
+    interaction: discord.Interaction,
+    channel: discord.VoiceChannel
+):
+
+    if not is_server_admin(interaction):
+        return await interaction.response.send_message(
+            "Administrator permission required.",
+            ephemeral=True
+        )
+
+    permissions = channel.permissions_for(interaction.guild.me)
+
+    if not permissions.view_channel or not permissions.send_messages:
+        return await interaction.response.send_message(
+            "I need View Channel and Send Messages permissions "
+            "in that voice channel's text chat.",
+            ephemeral=True
+        )
+
+    set_announcement_channel(
+        interaction.guild.id,
+        channel.id
+    )
+
+    await interaction.response.send_message(
+        f"**Announcement channel configured.**\n"
+        f"Messages will be sent in the voice chat of "
+        f"**{channel.name}** every 20 minutes.",
+        ephemeral=True
+    )
+
+    log.info(
+        "Announcement channel set to %s in %s",
+        channel.name,
+        interaction.guild.name
+    )
+
+
+# ==========================================
+# TEST ANNOUNCEMENT
+# ==========================================
+
+@bot.tree.command(
+    name="announcement_test",
+    description="Send a test VC announcement immediately."
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def announcement_test(
+    interaction: discord.Interaction
+):
+
+    if not is_server_admin(interaction):
+        return await interaction.response.send_message(
+            "Administrator permission required.",
+            ephemeral=True
+        )
+
+    channel_id = get_announcement_channel(interaction.guild.id)
+
+    if channel_id is None:
+        return await interaction.response.send_message(
+            "No announcement channel configured. "
+            "Use /announcement_set first.",
+            ephemeral=True
+        )
+
+    channel = interaction.guild.get_channel(channel_id)
+
+    if not isinstance(channel, discord.VoiceChannel):
+        return await interaction.response.send_message(
+            "Configured voice channel no longer exists.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+
+        await channel.send(ANNOUNCEMENT_MESSAGE)
+
+        await interaction.followup.send(
+            f"Test announcement sent to voice chat "
+            f"of **{channel.name}**.",
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+
+        await interaction.followup.send(
+            "I don't have permission to send messages in that voice chat.",
+            ephemeral=True
+        )
+
+    except discord.HTTPException:
+
+        log.exception("Test announcement failed")
+
+        await interaction.followup.send(
+            "Failed to send the test announcement.",
+            ephemeral=True
+        )
+
+
+# ==========================================
+# ANNOUNCEMENT STATUS
+# ==========================================
+
+@bot.tree.command(
+    name="announcement_status",
+    description="Check the configured announcement voice channel."
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def announcement_status(
+    interaction: discord.Interaction
+):
+
+    if not is_server_admin(interaction):
+        return await interaction.response.send_message(
+            "Administrator permission required.",
+            ephemeral=True
+        )
+
+    channel_id = get_announcement_channel(interaction.guild.id)
+
+    if channel_id is None:
+        return await interaction.response.send_message(
+            "Automatic announcements are not configured.",
+            ephemeral=True
+        )
+
+    channel = interaction.guild.get_channel(channel_id)
+
+    if not isinstance(channel, discord.VoiceChannel):
+        message = (
+            "The saved voice channel no longer exists. "
+            "Use /announcement_set to configure another."
+        )
+    else:
+        message = (
+            f"**Announcement voice channel:** {channel.name}\n"
+            f"**Frequency:** Every 20 minutes\n"
+            f"**Message:** {ANNOUNCEMENT_MESSAGE}"
+        )
+
+    await interaction.response.send_message(
+        message,
+        ephemeral=True
+    )
+
+
+# ==========================================
+# DISABLE ANNOUNCEMENTS
+# ==========================================
+
+@bot.tree.command(
+    name="announcement_disable",
+    description="Disable automatic announcements in this server."
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def announcement_disable(
+    interaction: discord.Interaction
+):
+
+    if not is_server_admin(interaction):
+        return await interaction.response.send_message(
+            "Administrator permission required.",
+            ephemeral=True
+        )
+
+    removed = remove_announcement_channel(interaction.guild.id)
+
+    message = (
+        "Automatic announcements have been disabled."
+        if removed
+        else "No announcement channel was configured."
+    )
+
+    await interaction.response.send_message(
+        message,
+        ephemeral=True
+    )
+
+
+# ==========================================
 # BOT READY EVENT
 # ==========================================
 
 @bot.event
 async def on_ready():
 
-    log.info("STEP 1: on_ready event started")
+    log.info("Bot ready event started")
 
     log.info(
         "Online as %s (%s)",
@@ -235,8 +569,6 @@ async def on_ready():
     try:
 
         # Initialize voice channel tracking
-        log.info("STEP 2: Initializing voice channels")
-
         for guild in bot.guilds:
 
             for channel in guild.voice_channels:
@@ -248,7 +580,7 @@ async def on_ready():
                         None
                     )
 
-        log.info("STEP 3: Voice channels initialized")
+        log.info("Voice channels initialized")
 
         # Publish initial status
         await bot.change_presence(
@@ -256,14 +588,23 @@ async def on_ready():
             activity=ACTIVITIES[0]
         )
 
-        log.info("STEP 4: Initial status published")
-
-        # Start automatic status rotation
+        # Start status rotation
         if not rotate_status.is_running():
-
             rotate_status.start()
 
-        log.info("STEP 5: Status rotation started")
+        # Start announcements
+        if not vc_announcement.is_running():
+            vc_announcement.start()
+
+        # Synchronise slash commands
+        synced = await bot.tree.sync()
+
+        log.info(
+            "Slash commands synced: %s commands",
+            len(synced)
+        )
+
+        log.info("1shot VC Guard fully operational.")
 
     except Exception:
 
