@@ -64,6 +64,16 @@ def init_database():
             )
         """)
 
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS voice_mute_locks (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                applied_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
+
 
 def set_announcement_channel(guild_id, channel_id):
     with sqlite3.connect(DB_PATH) as conn:
@@ -131,7 +141,6 @@ def is_yeet_authorized(guild, user_id):
     if guild is None:
         return False
 
-    # The actual server owner is always authorized.
     if guild.owner_id == user_id:
         return True
 
@@ -142,6 +151,50 @@ def is_yeet_authorized(guild, user_id):
         ).fetchone()
 
     return row is not None
+
+
+# ==========================================
+# PERSISTENT MUTE DATABASE FUNCTIONS
+# ==========================================
+
+def add_voice_mute_lock(guild_id, user_id, applied_by):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO voice_mute_locks (guild_id, user_id, applied_by)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id)
+            DO UPDATE SET applied_by = excluded.applied_by
+        """, (guild_id, user_id, applied_by))
+
+
+def remove_voice_mute_lock(guild_id, user_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "DELETE FROM voice_mute_locks WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id)
+        )
+        return cursor.rowcount > 0
+
+
+def has_voice_mute_lock(guild_id, user_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM voice_mute_locks WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id)
+        ).fetchone()
+
+    return row is not None
+
+
+def get_voice_mute_locks(guild_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT user_id, applied_by, created_at FROM voice_mute_locks "
+            "WHERE guild_id = ? ORDER BY created_at",
+            (guild_id,)
+        ).fetchall()
+
+    return rows
 
 
 init_database()
@@ -173,18 +226,17 @@ guild_locks = defaultdict(asyncio.Lock)
 
 
 # ==========================================
-# VC YEET SETTINGS / RUNTIME STATE
+# VC YEET / PERSISTENT MUTE RUNTIME STATE
 # ==========================================
 
 YEET_DELAY_SECONDS = 0.8
 YEET_MAX_CHANNELS_PER_CYCLE = 8
 YEET_COOLDOWN_SECONDS = 30
 
-# Active tasks, keyed by (guild_id, target_user_id).
-YEET_TASKS: dict[tuple[int, int], asyncio.Task] = {}
+YEET_TASKS = {}
+YEET_COOLDOWNS = {}
 
-# Executor cooldowns, keyed by (guild_id, executor_user_id).
-YEET_COOLDOWNS: dict[tuple[int, int], float] = {}
+MUTE_ENFORCING = set()
 
 
 def key_for(member: discord.Member) -> tuple[int, int]:
@@ -604,9 +656,8 @@ async def announcement_disable(
         ephemeral=True
     )
 
-
 # ==========================================
-# VC YEET — OWNER-MANAGED WHITELIST
+# SHARED VC YEET / MUTE AUTHORIZATION
 # ==========================================
 
 def is_server_owner(interaction: discord.Interaction) -> bool:
@@ -616,23 +667,16 @@ def is_server_owner(interaction: discord.Interaction) -> bool:
     )
 
 
-def is_yeet_channel_eligible(
-    target: discord.Member,
-    channel: discord.VoiceChannel
-) -> bool:
-    """Check whether the target and bot can use this voice channel."""
-
+def is_yeet_channel_eligible(target, channel):
     guild = target.guild
     bot_member = guild.me
 
     if bot_member is None:
         return False
 
-    # Do not send members to the server AFK channel.
     if guild.afk_channel and channel.id == guild.afk_channel.id:
         return False
 
-    # Automatically skip channels restricted from @everyone.
     everyone_permissions = channel.permissions_for(guild.default_role)
 
     if not (
@@ -658,7 +702,6 @@ def is_yeet_channel_eligible(
     ):
         return False
 
-    # Skip channels already at capacity.
     if channel.user_limit and len(channel.members) >= channel.user_limit:
         return False
 
@@ -666,18 +709,18 @@ def is_yeet_channel_eligible(
 
 
 # ==========================================
-# WHITELIST COMMAND GROUP
+# WHITELIST COMMANDS — SERVER OWNER ONLY
 # ==========================================
 
 whitelist_group = app_commands.Group(
     name="whitelist",
-    description="Manage who can use VC Yeet. Server owner only."
+    description="Manage who can use VC Yeet and persistent voice mute."
 )
 
 
 @whitelist_group.command(
     name="add",
-    description="Authorize a member to use VC Yeet."
+    description="Authorize a member to use VC Yeet and voice mute."
 )
 @app_commands.describe(member="Member to authorize")
 async def whitelist_add(
@@ -687,7 +730,7 @@ async def whitelist_add(
 
     if not is_server_owner(interaction):
         return await interaction.response.send_message(
-            "Only the server owner can manage the VC Yeet whitelist.",
+            "Only the server owner can manage this whitelist.",
             ephemeral=True
         )
 
@@ -710,14 +753,14 @@ async def whitelist_add(
     )
 
     await interaction.response.send_message(
-        f"{member.mention} has been added to the VC Yeet whitelist.",
+        f"{member.mention} has been added to the operator whitelist.",
         ephemeral=True
     )
 
 
 @whitelist_group.command(
     name="remove",
-    description="Revoke a member's VC Yeet access."
+    description="Revoke a member's operator access."
 )
 @app_commands.describe(member="Member to remove")
 async def whitelist_remove(
@@ -727,7 +770,7 @@ async def whitelist_remove(
 
     if not is_server_owner(interaction):
         return await interaction.response.send_message(
-            "Only the server owner can manage the VC Yeet whitelist.",
+            "Only the server owner can manage this whitelist.",
             ephemeral=True
         )
 
@@ -736,15 +779,11 @@ async def whitelist_remove(
         member.id
     )
 
-    if removed:
-        message = (
-            f"{member.mention} has been removed "
-            "from the VC Yeet whitelist."
-        )
-    else:
-        message = (
-            f"{member.mention} was not on the VC Yeet whitelist."
-        )
+    message = (
+        f"{member.mention} has been removed from the operator whitelist."
+        if removed
+        else f"{member.mention} was not on the whitelist."
+    )
 
     await interaction.response.send_message(
         message,
@@ -754,13 +793,13 @@ async def whitelist_remove(
 
 @whitelist_group.command(
     name="list",
-    description="List members authorized to use VC Yeet."
+    description="List all authorized operators."
 )
 async def whitelist_list(interaction: discord.Interaction):
 
     if not is_server_owner(interaction):
         return await interaction.response.send_message(
-            "Only the server owner can view the VC Yeet whitelist.",
+            "Only the server owner can view this whitelist.",
             ephemeral=True
         )
 
@@ -768,25 +807,25 @@ async def whitelist_list(interaction: discord.Interaction):
 
     if not user_ids:
         return await interaction.response.send_message(
-            "The VC Yeet whitelist is empty. "
+            "The operator whitelist is empty. "
             "The server owner is always authorized.",
             ephemeral=True
         )
 
-    entries = []
+    lines = []
 
     for user_id in user_ids:
         member = interaction.guild.get_member(user_id)
 
         if member is not None:
-            entries.append(f"• {member.mention} (`{user_id}`)")
+            lines.append(f"• {member.mention} (`{user_id}`)")
         else:
-            entries.append(
+            lines.append(
                 f"• Unknown / departed member (`{user_id}`)"
             )
 
     await interaction.response.send_message(
-        "**VC Yeet whitelist**\n" + "\n".join(entries),
+        "**Authorized operators**\n" + "\n".join(lines),
         ephemeral=True
     )
 
@@ -795,7 +834,7 @@ bot.tree.add_command(whitelist_group)
 
 
 # ==========================================
-# VC YEET — MAIN COMMAND
+# VC YEET COMMANDS
 # ==========================================
 
 @bot.tree.command(
@@ -804,13 +843,13 @@ bot.tree.add_command(whitelist_group)
 )
 @app_commands.guild_only()
 @app_commands.describe(
-    user_id="Discord user ID of the target member",
+    user_id="Discord user ID of target",
     cycles="Number of cycles (1–10)"
 )
 @app_commands.choices(
     cycles=[
-        app_commands.Choice(name=str(number), value=number)
-        for number in range(1, 11)
+        app_commands.Choice(name=str(n), value=n)
+        for n in range(1, 11)
     ]
 )
 async def vcyeet(
@@ -824,8 +863,7 @@ async def vcyeet(
 
     if not is_yeet_authorized(guild, executor.id):
         return await interaction.response.send_message(
-            "You are not authorized to use VC Yeet. "
-            "Ask the server owner to add you with `/whitelist add`.",
+            "You are not authorized. Ask the server owner to add you with `/whitelist add`.",
             ephemeral=True
         )
 
@@ -852,7 +890,7 @@ async def vcyeet(
 
         except discord.HTTPException:
             return await interaction.response.send_message(
-                "I couldn't retrieve that member. Please try again.",
+                "I couldn't retrieve that member.",
                 ephemeral=True
             )
 
@@ -864,62 +902,53 @@ async def vcyeet(
 
     if target.voice is None or target.voice.channel is None:
         return await interaction.response.send_message(
-            "That member is not currently connected to a voice channel.",
+            "That member is not in a voice channel.",
             ephemeral=True
         )
 
     task_key = (guild.id, target.id)
-    existing_task = YEET_TASKS.get(task_key)
+    existing = YEET_TASKS.get(task_key)
 
-    if existing_task is not None and not existing_task.done():
+    if existing is not None and not existing.done():
         return await interaction.response.send_message(
-            "That member already has an active VC Yeet sequence.",
+            "That member already has an active sequence.",
             ephemeral=True
         )
 
     now = asyncio.get_running_loop().time()
     cooldown_key = (guild.id, executor.id)
-    cooldown_until = YEET_COOLDOWNS.get(cooldown_key, 0.0)
 
-    if now < cooldown_until:
-        remaining = int(cooldown_until - now) + 1
+    if now < YEET_COOLDOWNS.get(cooldown_key, 0):
+        remaining = int(YEET_COOLDOWNS[cooldown_key] - now) + 1
 
         return await interaction.response.send_message(
-            f"Please wait {remaining} seconds before starting another sequence.",
+            f"Wait {remaining} seconds before starting another sequence.",
             ephemeral=True
         )
 
     original_channel = target.voice.channel
 
-    # Automatically find eligible channels.
-    # Locked, full, inaccessible, and AFK channels are skipped.
-    eligible_channels = [
+    channels = [
         channel
         for channel in guild.voice_channels
         if (
             channel.id != original_channel.id
             and is_yeet_channel_eligible(target, channel)
         )
-    ]
+    ][:YEET_MAX_CHANNELS_PER_CYCLE]
 
-    if not eligible_channels:
+    if not channels:
         return await interaction.response.send_message(
-            "No eligible public voice channels are available for that member.",
+            "No eligible public voice channels are available.",
             ephemeral=True
         )
 
-    eligible_channels = eligible_channels[
-        :YEET_MAX_CHANNELS_PER_CYCLE
-    ]
-
-    requested_cycles = cycles.value
-    maximum_moves = len(eligible_channels) * requested_cycles
+    count = cycles.value
 
     await interaction.response.send_message(
-        f"VC Yeet sequence started for **{target.display_name}**.\n"
-        f"Cycles: **{requested_cycles}**\n"
-        f"Eligible channels per cycle: **{len(eligible_channels)}**\n"
-        f"Maximum moves: **{maximum_moves}**\n"
+        f"VC Yeet started for **{target.display_name}**.\n"
+        f"Cycles: **{count}** | "
+        f"Channels per cycle: **{len(channels)}**.\n"
         "The sequence stops if the target disconnects.",
         ephemeral=True
     )
@@ -931,20 +960,13 @@ async def vcyeet(
     async def run_sequence():
 
         try:
-            for cycle_number in range(requested_cycles):
+            for cycle in range(count):
 
-                for channel in eligible_channels:
+                for channel in channels:
 
-                    # Stop if the target disconnects.
-                    # The sequence will not resume if they reconnect.
                     if target.voice is None or target.voice.channel is None:
-                        log.info(
-                            "VC Yeet stopped because target %s disconnected.",
-                            target.id
-                        )
                         return
 
-                    # Recheck permissions and capacity before every move.
                     if not is_yeet_channel_eligible(target, channel):
                         continue
 
@@ -952,93 +974,66 @@ async def vcyeet(
                         await target.move_to(
                             channel,
                             reason=(
-                                f"VC Yeet initiated by {executor} "
-                                f"({executor.id}); cycle "
-                                f"{cycle_number + 1}/{requested_cycles}"
+                                f"VC Yeet by {executor} "
+                                f"({executor.id}), cycle {cycle + 1}/{count}"
                             )
                         )
 
                     except (discord.Forbidden, discord.HTTPException):
                         log.exception(
-                            "VC Yeet could not move target %s to channel %s",
-                            target.id,
-                            channel.id
+                            "VC Yeet failed for target %s",
+                            target.id
                         )
                         return
 
                     await asyncio.sleep(YEET_DELAY_SECONDS)
 
-            # Return the target to their starting channel if they are still
-            # connected and the original channel is still accessible/free.
             if target.voice is not None and target.voice.channel is not None:
 
                 bot_member = guild.me
+                target_perms = original_channel.permissions_for(target)
+                bot_perms = original_channel.permissions_for(bot_member)
 
-                target_permissions = original_channel.permissions_for(target)
-                bot_permissions = original_channel.permissions_for(bot_member)
-
-                original_channel_has_room = (
+                has_room = (
                     not original_channel.user_limit
                     or len(original_channel.members) < original_channel.user_limit
                 )
 
                 if (
-                    target_permissions.view_channel
-                    and target_permissions.connect
-                    and bot_permissions.view_channel
-                    and bot_permissions.move_members
-                    and original_channel_has_room
+                    target_perms.view_channel
+                    and target_perms.connect
+                    and bot_perms.view_channel
+                    and bot_perms.move_members
+                    and has_room
                 ):
-                    try:
-                        await target.move_to(
-                            original_channel,
-                            reason=(
-                                "VC Yeet sequence completed; "
-                                "returning to starting channel"
-                            )
-                        )
-
-                    except (discord.Forbidden, discord.HTTPException):
-                        log.exception(
-                            "Could not return target %s to original channel %s",
-                            target.id,
-                            original_channel.id
-                        )
-
-            log.info(
-                "VC Yeet sequence completed for target %s after %s cycles.",
-                target.id,
-                requested_cycles
-            )
+                    await target.move_to(
+                        original_channel,
+                        reason="VC Yeet completed; return to starting channel"
+                    )
 
         except asyncio.CancelledError:
-            log.info(
-                "VC Yeet sequence cancelled for target %s.",
-                target.id
-            )
             raise
 
-        finally:
-            current_task = YEET_TASKS.get(task_key)
+        except discord.HTTPException:
+            log.exception(
+                "VC Yeet sequence error for %s",
+                target.id
+            )
 
-            if current_task is asyncio.current_task():
+        finally:
+            if YEET_TASKS.get(task_key) is asyncio.current_task():
                 YEET_TASKS.pop(task_key, None)
 
-    task = asyncio.create_task(run_sequence())
-    YEET_TASKS[task_key] = task
+    YEET_TASKS[task_key] = asyncio.create_task(run_sequence())
 
-
-# ==========================================
-# VC YEET — STOP COMMAND
-# ==========================================
 
 @bot.tree.command(
     name="vcyeet_stop",
-    description="Stop an active VC Yeet sequence for a member."
+    description="Stop an active VC Yeet sequence."
 )
 @app_commands.guild_only()
 @app_commands.describe(
-    user_id="Discord user ID of the target member"
+    user_id="Discord user ID of target"
 )
 async def vcyeet_stop(
     interaction: discord.Interaction,
@@ -1066,17 +1061,485 @@ async def vcyeet_stop(
 
     if task is None or task.done():
         return await interaction.response.send_message(
-            "No active VC Yeet sequence was found for that user.",
+            "No active sequence found for that user.",
             ephemeral=True
         )
 
     task.cancel()
 
     await interaction.response.send_message(
-        f"VC Yeet sequence stopped for user `{target_id}`.",
+        f"Stopped VC Yeet for `{target_id}`.",
         ephemeral=True
     )
 
+# ==========================================
+# PERSISTENT VOICE MUTE HELPERS
+# ==========================================
+
+async def apply_persistent_mute(
+    member: discord.Member,
+    reason: str
+) -> bool:
+
+    if member.voice is None or member.voice.channel is None:
+        return False
+
+    if member.voice.mute:
+        return True
+
+    guild = member.guild
+    bot_member = guild.me
+
+    if bot_member is None:
+        return False
+
+    permissions = member.voice.channel.permissions_for(bot_member)
+
+    if not permissions.mute_members:
+        log.warning(
+            "Missing Mute Members permission in %s",
+            member.voice.channel.name
+        )
+        return False
+
+    key = (guild.id, member.id)
+
+    if key in MUTE_ENFORCING:
+        return False
+
+    MUTE_ENFORCING.add(key)
+
+    try:
+        await member.edit(
+            mute=True,
+            reason=reason
+        )
+
+        log.info(
+            "Applied persistent server mute to %s (%s)",
+            member,
+            member.id
+        )
+
+        return True
+
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception(
+            "Could not server-mute %s (%s)",
+            member,
+            member.id
+        )
+        return False
+
+    finally:
+        MUTE_ENFORCING.discard(key)
+
+
+async def enforce_mute_lock(
+    member: discord.Member,
+    reason: str
+):
+    if has_voice_mute_lock(member.guild.id, member.id):
+        await apply_persistent_mute(member, reason)
+
+
+async def release_voice_mute(member: discord.Member):
+    """Remove the stored lock first, then lift the Discord server mute."""
+
+    remove_voice_mute_lock(
+        member.guild.id,
+        member.id
+    )
+
+    if member.voice is None or member.voice.channel is None:
+        return True
+
+    bot_member = member.guild.me
+
+    if bot_member is None:
+        return False
+
+    permissions = member.voice.channel.permissions_for(bot_member)
+
+    if not permissions.mute_members:
+        return False
+
+    try:
+        if member.voice.mute:
+            await member.edit(
+                mute=False,
+                reason="Persistent voice mute released by authorized operator"
+            )
+
+        return True
+
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception(
+            "Could not unmute %s (%s)",
+            member,
+            member.id
+        )
+        return False
+
+
+# ==========================================
+# PERSISTENT VOICE MUTE — SINGLE MEMBER
+# ==========================================
+
+@bot.tree.command(
+    name="voicemute",
+    description="Apply a persistent server mute to a member."
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    member="Member to restrict"
+)
+async def voicemute(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    if not is_yeet_authorized(
+        interaction.guild,
+        interaction.user.id
+    ):
+        return await interaction.response.send_message(
+            "You are not authorized to manage voice mutes.",
+            ephemeral=True
+        )
+
+    if member.bot:
+        return await interaction.response.send_message(
+            "Bots cannot be added to persistent mute locks.",
+            ephemeral=True
+        )
+
+    if member.voice is None or member.voice.channel is None:
+        return await interaction.response.send_message(
+            "That member is not currently in a voice channel.",
+            ephemeral=True
+        )
+
+    bot_permissions = member.voice.channel.permissions_for(
+        interaction.guild.me
+    )
+
+    if not bot_permissions.mute_members:
+        return await interaction.response.send_message(
+            "I need the **Mute Members** permission in that voice channel.",
+            ephemeral=True
+        )
+
+    add_voice_mute_lock(
+        interaction.guild.id,
+        member.id,
+        interaction.user.id
+    )
+
+    success = await apply_persistent_mute(
+        member,
+        f"Persistent voice mute applied by {interaction.user} ({interaction.user.id})"
+    )
+
+    if success:
+        await interaction.response.send_message(
+            f"Persistent voice mute is now active for {member.mention}. "
+            "Only an authorized operator can release it.",
+            ephemeral=True
+        )
+
+    else:
+        remove_voice_mute_lock(
+            interaction.guild.id,
+            member.id
+        )
+
+        await interaction.response.send_message(
+            "I couldn't apply the server mute. "
+            "Check my Mute Members permission and role hierarchy.",
+            ephemeral=True
+        )
+
+
+# ==========================================
+# PERSISTENT VOICE MUTE — SINGLE MEMBER RELEASE
+# ==========================================
+
+@bot.tree.command(
+    name="voiceunmute",
+    description="Release a member's persistent voice mute."
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    member="Member to release"
+)
+async def voiceunmute(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    if not is_yeet_authorized(
+        interaction.guild,
+        interaction.user.id
+    ):
+        return await interaction.response.send_message(
+            "You are not authorized to manage voice mutes.",
+            ephemeral=True
+        )
+
+    existed = has_voice_mute_lock(
+        interaction.guild.id,
+        member.id
+    )
+
+    success = await release_voice_mute(member)
+
+    if not existed:
+        return await interaction.response.send_message(
+            f"{member.mention} does not have a persistent mute lock.",
+            ephemeral=True
+        )
+
+    if success:
+        await interaction.response.send_message(
+            f"Persistent mute released for {member.mention}.",
+            ephemeral=True
+        )
+
+    else:
+        await interaction.response.send_message(
+            "The lock was removed, but I couldn't lift the server mute. "
+            "Check my permissions and role hierarchy.",
+            ephemeral=True
+        )
+
+
+# ==========================================
+# BULK PERSISTENT VOICE MUTE
+# CURRENT MEMBERS OF SELECTED CHANNEL ONLY
+# ==========================================
+
+@bot.tree.command(
+    name="voicemute_bulk",
+    description="Persistently mute everyone currently in a selected voice channel."
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    channel="Voice channel whose current members should be muted"
+)
+async def voicemute_bulk(
+    interaction: discord.Interaction,
+    channel: discord.VoiceChannel
+):
+
+    if not is_yeet_authorized(
+        interaction.guild,
+        interaction.user.id
+    ):
+        return await interaction.response.send_message(
+            "You are not authorized to manage voice mutes.",
+            ephemeral=True
+        )
+
+    bot_permissions = channel.permissions_for(interaction.guild.me)
+
+    if not bot_permissions.view_channel or not bot_permissions.mute_members:
+        return await interaction.response.send_message(
+            "I need View Channel and Mute Members permissions in that voice channel.",
+            ephemeral=True
+        )
+
+    members = [
+        member
+        for member in list(channel.members)
+        if not member.bot
+    ]
+
+    if not members:
+        return await interaction.response.send_message(
+            "There are no human members in that voice channel.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    muted_count = 0
+    failed = []
+
+    for member in members:
+
+        add_voice_mute_lock(
+            interaction.guild.id,
+            member.id,
+            interaction.user.id
+        )
+
+        if await apply_persistent_mute(
+            member,
+            f"Bulk persistent voice mute by {interaction.user} ({interaction.user.id})"
+        ):
+            muted_count += 1
+
+        else:
+            # Keep the restriction stored so it can be enforced
+            # when the bot has permission and the member is connected.
+            failed.append(member.display_name)
+
+    result = (
+        f"Bulk mute processed for **{channel.name}**.\n"
+        f"Persistent mute applied: **{muted_count}/{len(members)}**."
+    )
+
+    if failed:
+        result += (
+            "\nCould not mute immediately: "
+            + ", ".join(failed[:20])
+        )
+        result += (
+            "\nTheir restrictions remain stored and will be enforced "
+            "when possible."
+        )
+
+    await interaction.followup.send(
+        result,
+        ephemeral=True
+    )
+
+
+# ==========================================
+# BULK PERSISTENT VOICE UNMUTE
+# ==========================================
+
+@bot.tree.command(
+    name="voiceunmute_bulk",
+    description="Release persistent mute locks for current members of a voice channel."
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    channel="Voice channel whose current members should be released"
+)
+async def voiceunmute_bulk(
+    interaction: discord.Interaction,
+    channel: discord.VoiceChannel
+):
+
+    if not is_yeet_authorized(
+        interaction.guild,
+        interaction.user.id
+    ):
+        return await interaction.response.send_message(
+            "You are not authorized to manage voice mutes.",
+            ephemeral=True
+        )
+
+    members = [
+        member
+        for member in list(channel.members)
+        if not member.bot
+    ]
+
+    if not members:
+        return await interaction.response.send_message(
+            "There are no human members in that voice channel.",
+            ephemeral=True
+        )
+
+    await interaction.response.defer(ephemeral=True)
+
+    released = 0
+    failed = []
+
+    for member in members:
+
+        existed = has_voice_mute_lock(
+            interaction.guild.id,
+            member.id
+        )
+
+        if not existed:
+            continue
+
+        if await release_voice_mute(member):
+            released += 1
+
+        else:
+            failed.append(member.display_name)
+
+    result = (
+        f"Bulk release processed for **{channel.name}**.\n"
+        f"Restrictions released: **{released}**."
+    )
+
+    if failed:
+        result += (
+            "\nCould not lift Discord server mute for: "
+            + ", ".join(failed[:20])
+        )
+
+    await interaction.followup.send(
+        result,
+        ephemeral=True
+    )
+
+
+# ==========================================
+# LIST ACTIVE PERSISTENT MUTE RESTRICTIONS
+# ==========================================
+
+@bot.tree.command(
+    name="voicemute_list",
+    description="List members with active persistent voice mute restrictions."
+)
+@app_commands.guild_only()
+async def voicemute_list(
+    interaction: discord.Interaction
+):
+
+    if not is_yeet_authorized(
+        interaction.guild,
+        interaction.user.id
+    ):
+        return await interaction.response.send_message(
+            "You are not authorized to view persistent mute restrictions.",
+            ephemeral=True
+        )
+
+    rows = get_voice_mute_locks(interaction.guild.id)
+
+    if not rows:
+        return await interaction.response.send_message(
+            "There are no active persistent voice mute restrictions.",
+            ephemeral=True
+        )
+
+    lines = []
+
+    for user_id, applied_by, created_at in rows:
+
+        member = interaction.guild.get_member(user_id)
+
+        label = (
+            member.mention
+            if member
+            else f"Unknown / departed member (`{user_id}`)"
+        )
+
+        lines.append(
+            f"• {label} — applied by `{applied_by}` — {created_at}"
+        )
+
+    output = (
+        "**Persistent voice mute restrictions**\n"
+        + "\n".join(lines)
+    )
+
+    if len(output) > 1900:
+        output = output[:1850] + "\n…list truncated."
+
+    await interaction.response.send_message(
+        output,
+        ephemeral=True
+    )
 
 # ==========================================
 # BOT READY EVENT
@@ -1108,6 +1571,19 @@ async def on_ready():
                     )
 
         log.info("Voice channels initialized")
+
+        # Reapply persistent mute locks after bot restarts.
+        for guild in bot.guilds:
+
+            for channel in guild.voice_channels:
+
+                for member in list(channel.members):
+
+                    if has_voice_mute_lock(guild.id, member.id):
+                        await enforce_mute_lock(
+                            member,
+                            "Reapplying persistent voice mute after bot startup"
+                        )
 
         # Publish initial status.
         await bot.change_presence(
@@ -1153,7 +1629,24 @@ async def on_voice_state_update(
     after: discord.VoiceState
 ):
 
-    if member.bot or before.channel == after.channel:
+    if member.bot:
+        return
+
+    # Persistent server-mute enforcement:
+    # Reapply if a locked member is unmuted, or if they join
+    # a voice channel while a persistent restriction is active.
+    if (
+        after.channel is not None
+        and has_voice_mute_lock(member.guild.id, member.id)
+        and not after.mute
+    ):
+        await enforce_mute_lock(
+            member,
+            "Reapplying active persistent voice mute"
+        )
+
+    # A mute-state change does not require capacity enforcement.
+    if before.channel == after.channel:
         return
 
     key = key_for(member)
@@ -1225,5 +1718,3 @@ async def on_error(event, *args, **kwargs):
 log.info("Starting 1shot VC Guard...")
 
 bot.run(TOKEN)
-
-
