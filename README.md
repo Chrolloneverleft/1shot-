@@ -1,4 +1,4 @@
-# 1shot VC Guard
+# Vc Manager
 
 A Discord voice-channel capacity enforcement bot. It reads each standard voice channel's configured user limit. If a member enters a full limited channel, the bot tries to return that member to the voice channel they just left. If there is no usable previous channel, it disconnects them.
 
